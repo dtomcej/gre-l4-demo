@@ -5,52 +5,59 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"log"
+	"net"
+	"os"
+	"syscall"
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcap"
 	"golang.org/x/net/ipv4"
+	"golang.org/x/sys/unix"
+)
+
+var (
+	remoteIP          = net.IPv4(192, 168, 1, 125)
+	remotePort        = layers.TCPPort(32000)
+	serverIP          = net.IPv4(127, 0, 0, 1)
+	serverPort        = layers.TCPPort(9090)
+	proxyExternalIP   = net.IPv4(192, 168, 1, 114)
+	proxyExternalPort = layers.TCPPort(9000)
+	proxyInternalIP   = net.IPv4(127, 0, 0, 1)
+	proxyInternalPort = layers.TCPPort(10000)
 )
 
 func main() {
 	if handle, err := pcap.OpenLive("en0", 1600, true, pcap.BlockForever); err != nil {
 		panic(err)
-	} else if err := handle.SetBPFFilter("tcp and dst port 9000"); err != nil { // optional
-		// } else if err := handle.SetBPFFilter("tcp and dst port 9000"); err != nil { // optional
+	} else if err := handle.SetBPFFilter("tcp and port 9000 or 9090"); err != nil { // optional
 		panic(err)
 	} else {
 		packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
-		x := 1
-		for packet := range packetSource.Packets() {
-			fmt.Printf("Loop :%d\n", x)
-			x++
+		for srcPacket := range packetSource.Packets() {
+			fmt.Println("Hex dump of real IP packet taken as input:")
+			fmt.Println(hex.Dump(srcPacket.Data()))
+
+			fmt.Println("SHA1 of real IP packet taken as input:")
+			h := sha1.New()
+			h.Write(srcPacket.Data())
+			fmt.Println(base64.URLEncoding.EncodeToString(h.Sum(nil)))
+
+			packet := gopacket.NewPacket(srcPacket.Data(), layers.LayerTypeEthernet, gopacket.Default)
 			options := gopacket.SerializeOptions{
 				FixLengths:       true,
 				ComputeChecksums: true,
 			}
 
 			var (
-				NewEthernetLayer layers.Ethernet
-				NewIPLayer       layers.IPv4
-				NewTcpLayer      layers.TCP
-				NewPacketPayload gopacket.Payload
+				destIP   net.IP
+				srcIP    net.IP
+				proto    layers.IPProtocol
+				destPort layers.TCPPort
+				srcPort  layers.TCPPort
+				seq      uint32
 			)
-
-			// Check if the packet is Ethernet.
-			ethernetLayer := packet.Layer(layers.LayerTypeEthernet)
-			if ethernetLayer != nil {
-				// Packet is an Ethernet Packet.
-				ethernet, _ := ethernetLayer.(*layers.Ethernet)
-				fmt.Println("Ethernet layer detected.")
-				fmt.Println("Source MAC: ", ethernet.SrcMAC)
-				fmt.Println("Destination MAC: ", ethernet.DstMAC)
-				fmt.Println("Ethernet type: ", ethernet.EthernetType)
-				fmt.Println()
-				NewEthernetLayer = layers.Ethernet{
-					SrcMAC: ethernet.SrcMAC,
-					DstMAC: ethernet.DstMAC,
-				}
-			}
 
 			// Check if the packet is IPv4.
 			ipLayer := packet.Layer(layers.LayerTypeIPv4)
@@ -61,92 +68,272 @@ func main() {
 				fmt.Printf("From %s to %s\n", ip.SrcIP, ip.DstIP)
 				fmt.Println("Protocol: ", ip.Protocol)
 				fmt.Println()
-				NewIPLayer = layers.IPv4{
-					SrcIP:    ip.SrcIP,
-					DstIP:    ip.DstIP,
-					Version:  ip.Version,
-					TTL:      ip.TTL,
-					Protocol: ip.Protocol,
+
+				// Check if the packet is TCP.
+				tcpLayer := packet.Layer(layers.LayerTypeTCP)
+				if tcpLayer != nil {
+					tcp, _ := tcpLayer.(*layers.TCP)
+					fmt.Println("TCP layer detected.")
+					fmt.Printf("From port %d to %d\n", tcp.SrcPort, tcp.DstPort)
+					fmt.Println("Sequence number: ", tcp.Seq)
+					fmt.Println()
+
+					rewriteSourceDest(ip, tcp)
+
+					// Save New IP content for reporting.
+					destIP = ip.DstIP
+					srcIP = ip.SrcIP
+					proto = ip.Protocol
+
+					// Ssave new TCP content for reporting.
+					destPort = tcp.DstPort
+					srcPort = tcp.SrcPort
+					seq = tcp.Seq
+					err = tcp.SetNetworkLayerForChecksum(ip)
+					if err != nil {
+						panic(err)
+					}
+
+					fmt.Println()
+					fmt.Println()
+					fmt.Println("-------")
+					fmt.Println()
+					fmt.Println()
+					fmt.Println("IPv4 layer built.")
+					fmt.Printf("From %s to %s\n", srcIP, destIP)
+					fmt.Println("Protocol: ", proto)
+					fmt.Println()
+					fmt.Println("TCP layer built.")
+					fmt.Printf("From port %d to %d\n", srcPort, destPort)
+					fmt.Println("Sequence number: ", seq)
+					fmt.Println()
+
+					buffer := gopacket.NewSerializeBuffer()
+					err = gopacket.SerializePacket(buffer, options, packet)
+					if err != nil {
+						panic(err)
+					}
+					outgoingPacket := buffer.Bytes()
+					fmt.Println("Hex dump of new packet:")
+					fmt.Println(hex.Dump(outgoingPacket))
+					fmt.Println()
+					fmt.Println()
+					fmt.Println("-------")
+
+					fmt.Println()
+					fmt.Println()
+					fmt.Println("Writing to socket")
+					fmt.Println()
+					fmt.Println()
+					// If destination is remote, use external socket.
+					if net.IP.Equal(destIP, remoteIP) {
+						// _, err = io.WriteString(externalSocket, string(outgoingPacket))
+						// if err != nil {
+						// 	panic(err)
+						// }
+						fd, err := unix.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
+						if err != nil {
+							panic(err)
+						}
+						defer unix.Close(fd)
+
+						addr := unix.SockaddrInet4{Port: int(proxyExternalPort)}
+						copy(addr.Addr[:], proxyExternalIP)
+						err = unix.Sendto(fd, outgoingPacket, 0, &addr)
+						if err != nil {
+							panic(err)
+						}
+					} else {
+						// Use internal socket.
+						fmt.Println("Using internal socket")
+						fmt.Println()
+						fmt.Println()
+						// _, err = io.WriteString(internalSocket, string(outgoingPacket))
+						// if err != nil {
+						// 	panic(err)
+						// }
+
+						// fd, _ := unix.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
+						// addr := unix.SockaddrInet4{Port: int(proxyInternalPort)}
+						// copy(addr.Addr[:], proxyInternalIP)
+						// err = unix.Sendto(fd, outgoingIPPacket, 0, &addr)
+						// if err != nil {
+						// 	panic(err)
+						// }
+
+						NewPacket := gopacket.NewPacket(buffer.Bytes(), layers.LayerTypeIPv4, gopacket.Default)
+						NewIpLayer := NewPacket.Layer(layers.LayerTypeIPv4)
+						if NewIpLayer != nil {
+							// Packet is an IP Packet.
+							newip, _ := NewIpLayer.(*layers.IPv4)
+							fmt.Println("NewPacket is an IP Packet")
+							fmt.Println()
+							fmt.Println()
+
+							newtcpLayer := NewPacket.Layer(layers.LayerTypeTCP)
+							if newtcpLayer != nil {
+								newtcp, _ := newtcpLayer.(*layers.TCP)
+								fmt.Println("NewPacket has TCP")
+								fmt.Println()
+								fmt.Println()
+
+								ipHeaderBuf := gopacket.NewSerializeBuffer()
+								err := newip.SerializeTo(ipHeaderBuf, options)
+								if err != nil {
+									panic(err)
+								}
+								ipHeader, err := ipv4.ParseHeader(ipHeaderBuf.Bytes())
+								if err != nil {
+									panic(err)
+								}
+								tcpPayloadBuf := gopacket.NewSerializeBuffer()
+								err = gopacket.SerializeLayers(tcpPayloadBuf, options, newtcp)
+								if err != nil {
+									panic(err)
+								}
+								tcpPayload := tcpPayloadBuf.Bytes()
+								fmt.Println("Hex dump of new IP datagram:")
+								rawHeader, err := ipHeader.Marshal()
+								if err != nil {
+									panic(err)
+								}
+								newDatagram := append(rawHeader, tcpPayload...)
+								fmt.Println(hex.Dump(newDatagram))
+								fmt.Println()
+								fmt.Println()
+								fmt.Println("-------")
+								// XXX end of packet creation
+
+								// XXX send packet
+								var packetConn net.PacketConn
+								var rawConn *ipv4.RawConn
+								packetConn, err = net.ListenPacket("ip4:tcp", srcIP.String())
+								if err != nil {
+									panic(err)
+								}
+								rawConn, err = ipv4.NewRawConn(packetConn)
+								if err != nil {
+									panic(err)
+								}
+
+								err = rawConn.WriteTo(ipHeader, tcpPayloadBuf.Bytes(), nil)
+								if err != nil {
+									panic(err)
+								}
+								log.Printf("packet of length %d sent!\n", (len(ipHeader.String()) + len(tcpPayloadBuf.Bytes())))
+							}
+						}
+
+					}
+
+					fmt.Println()
+					fmt.Println()
+					fmt.Println("------------------")
+
 				}
 			}
-
-			// Check if the packet is TCP.
-			tcpLayer := packet.Layer(layers.LayerTypeTCP)
-			if tcpLayer != nil {
-				tcp, _ := tcpLayer.(*layers.TCP)
-				fmt.Println("TCP layer detected.")
-				fmt.Printf("From port %d to %d\n", tcp.SrcPort, tcp.DstPort)
-				fmt.Println("Sequence number: ", tcp.Seq)
-				fmt.Println()
-				NewTcpLayer = layers.TCP{
-					SrcPort: tcp.SrcPort,
-					DstPort: layers.TCPPort(9090),
-					Window:  tcp.Window,
-					Urgent:  tcp.Urgent,
-					Seq:     tcp.Seq,
-					Ack:     tcp.Ack,
-					ACK:     tcp.ACK,
-					SYN:     tcp.SYN,
-					FIN:     tcp.FIN,
-					RST:     tcp.RST,
-					URG:     tcp.URG,
-					ECE:     tcp.ECE,
-					CWR:     tcp.CWR,
-					NS:      tcp.NS,
-					PSH:     tcp.PSH,
-				}
-				_ = NewTcpLayer.SetNetworkLayerForChecksum(&NewIPLayer)
-			}
-
-			applicationLayer := packet.ApplicationLayer()
-			if applicationLayer != nil {
-				fmt.Println("Application layer/Payload found.")
-				fmt.Printf("%s\n", applicationLayer.Payload())
-				NewPacketPayload = gopacket.Payload(applicationLayer.Payload())
-			}
-
-			// And create the packet with the layers
-			ipHeaderBuffer := gopacket.NewSerializeBuffer()
-			err := NewIPLayer.SerializeTo(ipHeaderBuffer, options)
-			if err != nil {
-				panic(err)
-			}
-
-			ipHeader, err := ipv4.ParseHeader(ipHeaderBuffer.Bytes())
-			if err != nil {
-				panic(err)
-			}
-
-			ipHeaderBytes, err := ipHeader.Marshal()
-			if err != nil {
-				panic(err)
-			}
-
-			tcpPayloadBuffer := gopacket.NewSerializeBuffer()
-			err = gopacket.SerializeLayers(tcpPayloadBuffer, options, &NewTcpLayer, NewPacketPayload)
-			if err != nil {
-				panic(err)
-			}
-			buffer := gopacket.NewSerializeBuffer()
-			_ = gopacket.SerializeLayers(buffer, options,
-				&NewEthernetLayer,
-				&NewIPLayer,
-				&NewTcpLayer,
-				&NewPacketPayload)
-			outgoingPacket := buffer.Bytes()
-
-			NewPacketData := append(ipHeaderBytes, tcpPayloadBuffer.Bytes()...)
-			NewPacket := gopacket.NewPacket(NewPacketData, layers.LayerTypeEthernet, gopacket.Default)
-			fmt.Println("Hex dump of real IP packet taken as input:")
-			fmt.Println(hex.Dump(packet.Data()))
-			fmt.Println("SHA1 of real IP packet taken as input:")
-			h := sha1.New()
-			h.Write(packet.Data())
-			fmt.Println(base64.URLEncoding.EncodeToString(h.Sum(nil)))
-			fmt.Println("Hex dump of go packet serialization output:")
-			fmt.Println(hex.Dump(NewPacket.Data()))
-			fmt.Println("Hex dump of full go packet serialization output:")
-			fmt.Println(hex.Dump(outgoingPacket))
 		}
 	}
+}
+
+func rewriteSourceDest(ip *layers.IPv4, tcp *layers.TCP) {
+	// If the Source is the remote, rewrite destination to server.
+	if net.IP.Equal(ip.SrcIP, remoteIP) {
+		// Destination.
+		ip.DstIP = serverIP
+		tcp.DstPort = serverPort
+
+		// Source.
+		ip.SrcIP = proxyInternalIP
+		tcp.SrcPort = proxyInternalPort
+		return
+	}
+	// If the source port is the server, rewrite the destination to the remote.
+	if tcp.SrcPort == serverPort {
+		// Destination.
+		ip.DstIP = remoteIP
+		tcp.DstPort = remotePort
+
+		// Source.
+		ip.SrcIP = proxyExternalIP
+		tcp.SrcPort = proxyExternalPort
+	}
+
+}
+
+// netSocket is a file descriptor for a system socket.
+type netSocket struct {
+	// System file descriptor.
+	fd int
+}
+
+func (ns netSocket) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	n, err := syscall.Read(ns.fd, p)
+	if err != nil {
+		n = 0
+	}
+	return n, err
+}
+
+func (ns netSocket) Write(p []byte) (int, error) {
+	n, err := syscall.Write(ns.fd, p)
+	if err != nil {
+		n = 0
+	}
+	return n, err
+}
+
+// Creates a new netSocket for the next pending connection request.
+func (ns *netSocket) Accept() (*netSocket, error) {
+	// syscall.ForkLock doc states lock not needed for blocking accept.
+	nfd, _, err := syscall.Accept(ns.fd)
+	if err == nil {
+		syscall.CloseOnExec(nfd)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &netSocket{nfd}, nil
+}
+
+func (ns *netSocket) Close() error {
+	return syscall.Close(ns.fd)
+}
+
+// Creates a new socket file descriptor, binds it and listens on it.
+func newNetSocket(ip net.IP, port int) (*netSocket, error) {
+	// ForkLock docs state that socket syscall requires the lock.
+	syscall.ForkLock.Lock()
+	// AF_INET = Address Family for IPv4
+	// SOCK_STREAM = virtual circuit service
+	// 0: the protocol for SOCK_STREAM, there's only 1.
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		return nil, os.NewSyscallError("socket", err)
+	}
+	fmt.Println("FD: ", fd)
+	syscall.ForkLock.Unlock()
+
+	// Allow reuse of recently-used addresses.
+	if err = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1); err != nil {
+		syscall.Close(fd)
+		return nil, os.NewSyscallError("setsockopt", err)
+	}
+
+	// Bind the socket to a port
+	sa := &syscall.SockaddrInet4{Port: port}
+	copy(sa.Addr[:], ip)
+	if err = syscall.Bind(fd, sa); err != nil {
+		return nil, os.NewSyscallError("bind", err)
+	}
+
+	// Listen for incoming connections.
+	if err = syscall.Listen(fd, syscall.SOMAXCONN); err != nil {
+		return nil, os.NewSyscallError("listen", err)
+	}
+
+	return &netSocket{fd: fd}, nil
 }
