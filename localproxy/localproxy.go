@@ -66,6 +66,8 @@ func processPackets(handle *pcap.Handle, iface *net.Interface) error {
 			continue
 		}
 
+		_, _ = buildNewGREPacket(handle, iface, srcPacket)
+
 		err = handle.WritePacketData(packet)
 		if err != nil {
 			fmt.Println("packet data writing failed")
@@ -128,10 +130,10 @@ func buildNewPacket(handle *pcap.Handle, iface *net.Interface, srcPacket gopacke
 		ComputeChecksums: true,
 	}
 	if payload == nil {
-		// No payload, rewrite without
+		// No payload, serialize without.
 		err = gopacket.SerializeLayers(buffer, options, eth, ip, tcp)
 	} else {
-		// No payload, rewrite without
+		// Serialize with payload.
 		err = gopacket.SerializeLayers(buffer, options, eth, ip, tcp, gopacket.Payload(payload))
 	}
 	if err != nil {
@@ -139,6 +141,58 @@ func buildNewPacket(handle *pcap.Handle, iface *net.Interface, srcPacket gopacke
 	}
 	outgoingPacket := buffer.Bytes()
 	fmt.Println("Hex dump of new packet:")
+	fmt.Println(hex.Dump(outgoingPacket))
+
+	fmt.Println("------------------")
+
+	return outgoingPacket, nil
+}
+
+func buildNewGREPacket(handle *pcap.Handle, iface *net.Interface, srcPacket gopacket.Packet) ([]byte, error) {
+	// Get the packet Ethernet layer.
+	eth, err := getEthernetLayer(srcPacket)
+	if err != nil {
+		return nil, err
+	}
+	// Get the packet IPv4 layer.
+	ip, err := getIPLayer(srcPacket)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create a new GRE layer.
+	gre := newGRELayer()
+
+	if !shouldProcessGRE(ip) {
+		return nil, nil
+	}
+
+	// Get the packet payload.
+	payload, err := getEthernetPayload(srcPacket)
+	if err != nil {
+		return nil, err
+	}
+
+	rewritePacketLayersGRE(eth, ip, iface)
+	printPacketDataGRE(eth, ip)
+
+	buffer := gopacket.NewSerializeBuffer()
+	options := gopacket.SerializeOptions{
+		FixLengths:       true,
+		ComputeChecksums: true,
+	}
+	if payload == nil {
+		// No payload, serialize without.
+		err = gopacket.SerializeLayers(buffer, options, eth, ip, gre)
+	} else {
+		// Serialize with payload.
+		err = gopacket.SerializeLayers(buffer, options, eth, ip, gre, gopacket.Payload(payload))
+	}
+	if err != nil {
+		panic(err)
+	}
+	outgoingPacket := buffer.Bytes()
+	fmt.Println("Hex dump of new GRE packet:")
 	fmt.Println(hex.Dump(outgoingPacket))
 
 	fmt.Println("------------------")
@@ -166,6 +220,17 @@ func getEthernetLayer(packet gopacket.Packet) (*layers.Ethernet, error) {
 	}
 	return &eth, nil
 
+}
+
+func getEthernetPayload(packet gopacket.Packet) ([]byte, error) {
+	ethernetLayer := packet.Layer(layers.LayerTypeEthernet)
+	if ethernetLayer == nil {
+		return nil, fmt.Errorf("no Ethernet layer found in packet")
+	}
+
+	ethernet, _ := ethernetLayer.(*layers.Ethernet)
+
+	return ethernet.Payload, nil
 }
 
 func getIPLayer(packet gopacket.Packet) (*layers.IPv4, error) {
@@ -248,6 +313,28 @@ func getApplicationLayer(packet gopacket.Packet) []byte {
 	return applicationLayer.Payload()
 }
 
+func newGRELayer() *layers.GRE {
+	gre := layers.GRE{
+		ChecksumPresent:   true,
+		RoutingPresent:    false,
+		KeyPresent:        false,
+		SeqPresent:        false,
+		StrictSourceRoute: false,
+		AckPresent:        false,
+		RecursionControl:  0,
+		Flags:             0,
+		Version:           0,
+		Protocol:          layers.EthernetTypeIPv4,
+		Checksum:          0,
+		Offset:            0,
+		Key:               0,
+		Seq:               0,
+		Ack:               0,
+	}
+
+	return &gre
+}
+
 func rewritePacketLayers(eth *layers.Ethernet, ip *layers.IPv4, tcp *layers.TCP, iface *net.Interface) {
 	// If the Source is the remote, rewrite destination to server.
 	if net.IP.Equal(ip.SrcIP, remoteIP) && tcp.SrcPort == remotePort {
@@ -288,6 +375,45 @@ func rewritePacketLayers(eth *layers.Ethernet, ip *layers.IPv4, tcp *layers.TCP,
 
 }
 
+func rewritePacketLayersGRE(eth *layers.Ethernet, ip *layers.IPv4, iface *net.Interface) {
+	// Set new IP protocol to GRE (47).
+	ip.Protocol = layers.IPProtocolGRE
+
+	// If the Source is the remote, rewrite destination to server.
+	if net.IP.Equal(ip.SrcIP, remoteIP) {
+		// Get destination hardware address.
+		hwAddr := arpLookup(gatewayIP)
+		if hwAddr == nil {
+			panic("EMPTY MAC FROM ARP")
+		}
+		// Set destination.
+		eth.DstMAC = hwAddr
+		ip.DstIP = serverIP
+
+		// Set source.
+		eth.SrcMAC = iface.HardwareAddr
+		ip.SrcIP = proxyIP
+		return
+	}
+	// If the source is the server, rewrite the destination to the remote.
+	if net.IP.Equal(ip.SrcIP, serverIP) {
+		// Get destination hardware address.
+		hwAddr := arpLookup(gatewayIP)
+		if hwAddr == nil {
+			panic("EMPTY MAC FROM ARP")
+		}
+
+		// Set destination.
+		eth.DstMAC = hwAddr
+		ip.DstIP = remoteIP
+
+		// Set source.
+		eth.SrcMAC = iface.HardwareAddr
+		ip.SrcIP = proxyIP
+	}
+
+}
+
 func shouldProcess(ip *layers.IPv4, tcp *layers.TCP) bool {
 	// If the Source is the remote, and destination is proxy.
 	if net.IP.Equal(ip.SrcIP, remoteIP) && tcp.SrcPort == remotePort && net.IP.Equal(ip.DstIP, proxyIP) && tcp.DstPort == proxyPort {
@@ -296,6 +422,23 @@ func shouldProcess(ip *layers.IPv4, tcp *layers.TCP) bool {
 
 	// If the Source is the server, and destination is proxy.
 	if net.IP.Equal(ip.SrcIP, serverIP) && tcp.SrcPort == serverPort && net.IP.Equal(ip.DstIP, proxyIP) && tcp.DstPort == proxyPort {
+		return true
+	}
+
+	fmt.Println("Skipping packet")
+	fmt.Println()
+	fmt.Println()
+	return false
+}
+
+func shouldProcessGRE(ip *layers.IPv4) bool {
+	// If the Source is the remote, and destination is proxy.
+	if net.IP.Equal(ip.SrcIP, remoteIP) && net.IP.Equal(ip.DstIP, proxyIP) {
+		return true
+	}
+
+	// If the Source is the server, and destination is proxy.
+	if net.IP.Equal(ip.SrcIP, serverIP) && net.IP.Equal(ip.DstIP, proxyIP) {
 		return true
 	}
 
@@ -354,4 +497,16 @@ func printPacketData(eth *layers.Ethernet, ip *layers.IPv4, tcp *layers.TCP) {
 	fmt.Println("Sequence number: ", tcp.Seq)
 	fmt.Println()
 
+}
+
+func printPacketDataGRE(eth *layers.Ethernet, ip *layers.IPv4) {
+	fmt.Println("New packet details:")
+	fmt.Println()
+	fmt.Println("Source MAC: ", eth.SrcMAC)
+	fmt.Println("Destination MAC: ", eth.DstMAC)
+	fmt.Println("Ethernet type: ", eth.EthernetType)
+	fmt.Println()
+	fmt.Printf("From %s to %s\n", ip.SrcIP, ip.DstIP)
+	fmt.Println("Protocol: ", ip.Protocol)
+	fmt.Println()
 }
