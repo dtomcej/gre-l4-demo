@@ -8,7 +8,6 @@ import (
 	"net"
 	"os/exec"
 	"strings"
-	"time"
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
@@ -18,10 +17,11 @@ import (
 var (
 	remoteIP      = net.IPv4(192, 168, 1, 125)
 	remotePort    = layers.TCPPort(32000)
-	serverIP      = net.IPv4(192, 168, 1, 114)
-	serverPort    = layers.TCPPort(9090)
+	serverIP      = net.IPv4(172, 217, 13, 238)
+	serverPort    = layers.TCPPort(80)
 	proxyIP       = net.IPv4(192, 168, 1, 114)
 	proxyPort     = layers.TCPPort(9000)
+	gatewayIP     = net.IPv4(192, 168, 1, 1)
 	interfaceName = "en0"
 )
 
@@ -33,8 +33,8 @@ func main() {
 		panic(err)
 	}
 
-	// Create a TCP listener to capture traffic.
-	go createListenter(proxyIP.String(), proxyPort)
+	// // Create a TCP listener to capture traffic.
+	// go createListenter(proxyIP.String(), proxyPort)
 
 	// Open up a pcap handle for packet reads/writes.
 	handle, err := pcap.OpenLive(iface.Name, 65536, true, pcap.BlockForever)
@@ -54,17 +54,17 @@ func main() {
 	}
 }
 
-func createListenter(host string, port layers.TCPPort) {
-	address := fmt.Sprintf("%s:%d", host, port)
-	fmt.Println("Opening listener on: ", address)
-	_, err := net.Listen("tcp", address)
-	if err != nil {
-		panic(err)
-	}
-	for {
-		time.Sleep(2 * time.Second)
-	}
-}
+// func createListenter(host string, port layers.TCPPort) {
+// 	address := fmt.Sprintf("%s:%d", host, port)
+// 	fmt.Println("Opening listener on: ", address)
+// 	_, err := net.Listen("tcp", address)
+// 	if err != nil {
+// 		panic(err)
+// 	}
+// 	for {
+// 		time.Sleep(2 * time.Second)
+// 	}
+// }
 
 func processPackets(handle *pcap.Handle, iface *net.Interface) error {
 	packetSource := gopacket.NewPacketSource(handle, layers.LayerTypeEthernet)
@@ -124,6 +124,7 @@ func buildNewPacket(handle *pcap.Handle, iface *net.Interface, srcPacket gopacke
 	}
 
 	rewritePacketLayers(eth, ip, tcp, iface)
+	printPacketData(eth, ip, tcp)
 
 	err = tcp.SetNetworkLayerForChecksum(ip)
 	if err != nil {
@@ -143,7 +144,6 @@ func buildNewPacket(handle *pcap.Handle, iface *net.Interface, srcPacket gopacke
 	fmt.Println("Hex dump of new packet:")
 	fmt.Println(hex.Dump(outgoingPacket))
 
-	printPacketData(eth, ip, tcp)
 	fmt.Println("------------------")
 
 	return outgoingPacket, nil
@@ -242,8 +242,10 @@ func rewritePacketLayers(eth *layers.Ethernet, ip *layers.IPv4, tcp *layers.TCP,
 	// If the Source is the remote, rewrite destination to server.
 	if net.IP.Equal(ip.SrcIP, remoteIP) && tcp.SrcPort == remotePort {
 		// Get destination hardware address.
-		hwAddr := arpLookup(serverIP)
-
+		hwAddr := arpLookup(gatewayIP)
+		if hwAddr == nil {
+			panic("EMPTY MAC FROM ARP")
+		}
 		// Set destination.
 		eth.DstMAC = hwAddr
 		ip.DstIP = serverIP
@@ -258,7 +260,10 @@ func rewritePacketLayers(eth *layers.Ethernet, ip *layers.IPv4, tcp *layers.TCP,
 	// If the source port is the server, rewrite the destination to the remote.
 	if net.IP.Equal(ip.SrcIP, serverIP) && tcp.SrcPort == serverPort {
 		// Get destination hardware address.
-		hwAddr := arpLookup(remoteIP)
+		hwAddr := arpLookup(gatewayIP)
+		if hwAddr == nil {
+			panic("EMPTY MAC FROM ARP")
+		}
 
 		// Set destination.
 		eth.DstMAC = hwAddr
@@ -293,20 +298,36 @@ func shouldProcess(ip *layers.IPv4, tcp *layers.TCP) bool {
 func arpLookup(ip net.IP) net.HardwareAddr {
 	data, err := exec.Command("arp", "-l", ip.String()).Output()
 	if err != nil {
-		return nil
+		panic(err)
 	}
 	for _, line := range strings.Split(string(data), "\n") {
 		fields := strings.Fields(line)
 		if len(fields) < 3 {
 			continue
 		}
-		hw, err := net.ParseMAC(fields[3])
+		fmt.Println("FIELD 3: ", fields[3])
+		fmt.Println("Padded Mac: ", padMAC(fields[3]))
+		hw, err := net.ParseMAC(padMAC(fields[3]))
 		if err != nil {
-			return nil
+			panic(err)
 		}
 		return hw
 	}
 	return nil
+}
+
+func padMAC(mac string) string {
+	newMacSlice := []string{}
+	pieces := strings.Split(mac, ":")
+	for _, piece := range pieces {
+		if len(piece) < 2 {
+			piece = "0" + piece
+		}
+
+		newMacSlice = append(newMacSlice, piece)
+	}
+
+	return strings.Join(newMacSlice, ":")
 }
 
 func printPacketData(eth *layers.Ethernet, ip *layers.IPv4, tcp *layers.TCP) {
