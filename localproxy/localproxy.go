@@ -54,18 +54,6 @@ func main() {
 	}
 }
 
-// func createListenter(host string, port layers.TCPPort) {
-// 	address := fmt.Sprintf("%s:%d", host, port)
-// 	fmt.Println("Opening listener on: ", address)
-// 	_, err := net.Listen("tcp", address)
-// 	if err != nil {
-// 		panic(err)
-// 	}
-// 	for {
-// 		time.Sleep(2 * time.Second)
-// 	}
-// }
-
 func processPackets(handle *pcap.Handle, iface *net.Interface) error {
 	packetSource := gopacket.NewPacketSource(handle, layers.LayerTypeEthernet)
 	for srcPacket := range packetSource.Packets() {
@@ -123,6 +111,9 @@ func buildNewPacket(handle *pcap.Handle, iface *net.Interface, srcPacket gopacke
 		return nil, nil
 	}
 
+	// Get the packet payload.
+	payload := getApplicationLayer(srcPacket)
+
 	rewritePacketLayers(eth, ip, tcp, iface)
 	printPacketData(eth, ip, tcp)
 
@@ -136,7 +127,13 @@ func buildNewPacket(handle *pcap.Handle, iface *net.Interface, srcPacket gopacke
 		FixLengths:       true,
 		ComputeChecksums: true,
 	}
-	err = gopacket.SerializeLayers(buffer, options, eth, ip, tcp)
+	if payload == nil {
+		// No payload, rewrite without
+		err = gopacket.SerializeLayers(buffer, options, eth, ip, tcp)
+	} else {
+		// No payload, rewrite without
+		err = gopacket.SerializeLayers(buffer, options, eth, ip, tcp, gopacket.Payload(payload))
+	}
 	if err != nil {
 		panic(err)
 	}
@@ -238,6 +235,19 @@ func getTCPLayer(packet gopacket.Packet) (*layers.TCP, error) {
 
 }
 
+func getApplicationLayer(packet gopacket.Packet) []byte {
+	applicationLayer := packet.ApplicationLayer()
+	if applicationLayer == nil {
+		fmt.Println("no payload found in packet")
+		return nil
+	}
+
+	fmt.Println("Application layer/Payload found.")
+	fmt.Printf("%s\n", applicationLayer.Payload())
+
+	return applicationLayer.Payload()
+}
+
 func rewritePacketLayers(eth *layers.Ethernet, ip *layers.IPv4, tcp *layers.TCP, iface *net.Interface) {
 	// If the Source is the remote, rewrite destination to server.
 	if net.IP.Equal(ip.SrcIP, remoteIP) && tcp.SrcPort == remotePort {
@@ -305,8 +315,8 @@ func arpLookup(ip net.IP) net.HardwareAddr {
 		if len(fields) < 3 {
 			continue
 		}
-		fmt.Println("FIELD 3: ", fields[3])
-		fmt.Println("Padded Mac: ", padMAC(fields[3]))
+
+		// We have to pad the mac because arp can return shortened values.
 		hw, err := net.ParseMAC(padMAC(fields[3]))
 		if err != nil {
 			panic(err)
