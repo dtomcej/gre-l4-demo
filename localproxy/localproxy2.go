@@ -36,13 +36,6 @@ func main() {
 	} else {
 		packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
 		for srcPacket := range packetSource.Packets() {
-			fmt.Println("Hex dump of real IP packet taken as input:")
-			fmt.Println(hex.Dump(srcPacket.Data()))
-
-			fmt.Println("SHA1 of real IP packet taken as input:")
-			h := sha1.New()
-			h.Write(srcPacket.Data())
-			fmt.Println(base64.URLEncoding.EncodeToString(h.Sum(nil)))
 
 			packet := gopacket.NewPacket(srcPacket.Data(), layers.LayerTypeEthernet, gopacket.Default)
 			options := gopacket.SerializeOptions{
@@ -64,19 +57,30 @@ func main() {
 			if ipLayer != nil {
 				// Packet is an IP Packet.
 				ip, _ := ipLayer.(*layers.IPv4)
-				fmt.Println("IPv4 layer detected.")
-				fmt.Printf("From %s to %s\n", ip.SrcIP, ip.DstIP)
-				fmt.Println("Protocol: ", ip.Protocol)
-				fmt.Println()
 
 				// Check if the packet is TCP.
 				tcpLayer := packet.Layer(layers.LayerTypeTCP)
 				if tcpLayer != nil {
 					tcp, _ := tcpLayer.(*layers.TCP)
+					if !shouldProcess(ip, tcp) {
+						continue
+					}
+					fmt.Println("IPv4 layer detected.")
+					fmt.Printf("From %s to %s\n", ip.SrcIP, ip.DstIP)
+					fmt.Println("Protocol: ", ip.Protocol)
+					fmt.Println()
 					fmt.Println("TCP layer detected.")
 					fmt.Printf("From port %d to %d\n", tcp.SrcPort, tcp.DstPort)
 					fmt.Println("Sequence number: ", tcp.Seq)
 					fmt.Println()
+
+					fmt.Println("Hex dump of real IP packet taken as input:")
+					fmt.Println(hex.Dump(srcPacket.Data()))
+
+					fmt.Println("SHA1 of real IP packet taken as input:")
+					h := sha1.New()
+					h.Write(srcPacket.Data())
+					fmt.Println(base64.URLEncoding.EncodeToString(h.Sum(nil)))
 
 					rewriteSourceDest(ip, tcp)
 
@@ -259,6 +263,23 @@ func rewriteSourceDest(ip *layers.IPv4, tcp *layers.TCP) {
 		tcp.SrcPort = proxyExternalPort
 	}
 
+}
+
+func shouldProcess(ip *layers.IPv4, tcp *layers.TCP) bool {
+	// If the Source is the remote, and destination is proxy.
+	if net.IP.Equal(ip.SrcIP, remoteIP) && tcp.SrcPort == remotePort && net.IP.Equal(ip.DstIP, proxyExternalIP) && tcp.DstPort == proxyExternalPort {
+		return true
+	}
+
+	// If the Source is the server, and destination is proxy.
+	if net.IP.Equal(ip.SrcIP, serverIP) && tcp.SrcPort == serverPort && net.IP.Equal(ip.DstIP, proxyInternalIP) && tcp.DstPort == proxyInternalPort {
+		return true
+	}
+
+	fmt.Println("Skipping packet")
+	fmt.Println()
+	fmt.Println()
+	return false
 }
 
 // netSocket is a file descriptor for a system socket.
