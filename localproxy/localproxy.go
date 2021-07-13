@@ -15,11 +15,16 @@ import (
 )
 
 var (
-	remoteIP      = net.IPv4(192, 168, 1, 125)
-	remotePort    = layers.TCPPort(32000)
-	serverIP      = net.IPv4(172, 217, 13, 238)
-	serverPort    = layers.TCPPort(80)
-	proxyIP       = net.IPv4(192, 168, 1, 114)
+	// Remote system accessing proxy.
+	remoteIP   = net.IPv4(192, 168, 1, 123)
+	remotePort = layers.TCPPort(32000)
+
+	// Main traefik.io IP.
+	serverIP   = net.IPv4(75, 2, 60, 5)
+	serverPort = layers.TCPPort(443)
+
+	// IP of proxy running this script.
+	proxyIP       = net.IPv4(192, 168, 1, 105)
 	proxyPort     = layers.TCPPort(9000)
 	gatewayIP     = net.IPv4(192, 168, 1, 1)
 	interfaceName = "en0"
@@ -66,7 +71,8 @@ func processPackets(handle *pcap.Handle, iface *net.Interface) error {
 			continue
 		}
 
-		_, _ = buildNewGREPacket(handle, iface, srcPacket)
+		// Disable GRE Packet Creation for TLS PoC.
+		// _, _ = buildNewGREPacket(handle, iface, srcPacket)
 
 		err = handle.WritePacketData(packet)
 		if err != nil {
@@ -417,11 +423,17 @@ func rewritePacketLayersGRE(eth *layers.Ethernet, ip *layers.IPv4, iface *net.In
 func shouldProcess(ip *layers.IPv4, tcp *layers.TCP) bool {
 	// If the Source is the remote, and destination is proxy.
 	if net.IP.Equal(ip.SrcIP, remoteIP) && tcp.SrcPort == remotePort && net.IP.Equal(ip.DstIP, proxyIP) && tcp.DstPort == proxyPort {
+		fmt.Println("Processing packet from remote to proxy")
+		fmt.Println()
+		fmt.Println()
 		return true
 	}
 
 	// If the Source is the server, and destination is proxy.
 	if net.IP.Equal(ip.SrcIP, serverIP) && tcp.SrcPort == serverPort && net.IP.Equal(ip.DstIP, proxyIP) && tcp.DstPort == proxyPort {
+		fmt.Println("Processing packet from destination to proxy")
+		fmt.Println()
+		fmt.Println()
 		return true
 	}
 
