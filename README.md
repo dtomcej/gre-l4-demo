@@ -1,6 +1,7 @@
 # gre-l4-demo
 
 ## System Setup
+
 This PoC is run on a MBP running Big Sur 11.4.
 
 The PoC allows for a stateless proxy that handles and rewrites request and response packets at the IP level.
@@ -20,6 +21,7 @@ These IP addresses are used for firewall and packet filtering, and although they
 Note that the serverIP and serverPort should match the request that we are using on the remote system (aka if you want to use TLS, port 443 should be used).
 
 ### Update pf firewall rules
+
 Because the PoC uses pcap instead of `net.ListenIP`, the interfaces return nack packets etc, and cause havoc with our logic.
 To prevent this, we use the mac built-in firewall to prevent the packets from reaching the system, and therefore don't have to deal with duplicate responses.
 We need to append 2 firewall rules to `/etc/pf.conf`
